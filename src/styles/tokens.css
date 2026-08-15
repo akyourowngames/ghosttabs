@@ -1,0 +1,49 @@
+/* GhostTab design tokens — single source of truth (PART B #15).
+   Restrained, premium dark palette. One brand accent. */
+
+:root {
+  --radius: 0.75rem;
+
+  /* Base surfaces */
+  --background: 222 24% 5%; /* #090A0D */
+  --foreground: 220 14% 96%; /* #F4F5F7 */
+
+  --surface: 222 20% 9%; /* #101217 */
+  --surface-elevated: 222 18% 12%; /* #151820 */
+
+  --border: 222 16% 18%; /* #252933 */
+  --border-strong: 222 14% 24%; /* #343945 */
+
+  --card: 222 20% 9%;
+  --card-foreground: 220 14% 96%;
+
+  --popover: 222 22% 7%;
+  --popover-foreground: 220 14% 96%;
+
+  /* Brand — single GhostTab accent (PART B #15) */
+  --primary: 258 90% 66%; /* #8B5CF6 */
+  --primary-foreground: 0 0% 100%;
+  --primary-soft: 258 80% 72%; /* #A78BFA glow */
+
+  --secondary: 222 16% 14%;
+  --secondary-foreground: 220 14% 96%;
+
+  --muted: 222 14% 16%;
+  --muted-foreground: 220 9% 64%; /* #6F7582 */
+
+  --accent: 222 16% 16%;
+  --accent-foreground: 220 14% 96%;
+
+  --input: 222 16% 18%;
+  --ring: 258 90% 66%;
+
+  /* Semantic colors — reserved for meaning (PART B #16) */
+  --success: 160 64% 59%; /* #34D399 */
+  --success-foreground: 222 30% 8%;
+  --warning: 43 96% 56%; /* #FBBF24 */
+  --warning-foreground: 222 30% 8%;
+  --danger: 0 91% 71%; /* #F87171 */
+  --danger-foreground: 222 30% 8%;
+  --info: 217 91% 65%; /* #60A5FA */
+  --info-foreground: 222 30% 8%;
+}
