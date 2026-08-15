@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/Button";
 import { Brand } from "@/components/Brand";
 import {
   buildWorkspaceContext,
-  chatInWorkspace,
+  chatInWorkspaceStream,
   loadChat,
   saveChat,
   parseMemoryCommand,
@@ -83,15 +83,27 @@ export function ChatView({
     // Feed the system note into the model so it can acknowledge the edit.
     const effectiveUser = sysNote ? `${text}\n${sysNote}` : text;
 
+    // Add an empty assistant placeholder that we stream tokens into.
+    setTurns((t) => [...t, { role: "assistant", content: "" }]);
+
     try {
-      const reply = await chatInWorkspace({
-        contextText,
-        history: next,
-        userMessage: effectiveUser,
-        apiKey: settings.apiKey.trim(),
-        model: settings.model.trim() || "tencent/hy3:free",
-      });
-      const assistantTurn: ChatTurn = { role: "assistant", content: reply };
+      const full = await chatInWorkspaceStream(
+        {
+          contextText,
+          history: next,
+          userMessage: effectiveUser,
+          apiKey: settings.apiKey.trim(),
+          model: settings.model.trim() || "tencent/hy3:free",
+        },
+        (partial) => {
+          setTurns((prev) => {
+            const copy = prev.slice();
+            copy[copy.length - 1] = { role: "assistant", content: partial };
+            return copy;
+          });
+        }
+      );
+      const assistantTurn: ChatTurn = { role: "assistant", content: full };
       const updated = [...next, assistantTurn];
       setTurns(updated);
       await saveChat(wsId, updated);

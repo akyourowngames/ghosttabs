@@ -69,7 +69,15 @@ export function buildWorkspaceContext(
   return L.join("\n");
 }
 
-const CHAT_SYSTEM = `You are GhostTab's workspace assistant. You have full knowledge of the user's workspace: its goal, decisions, goals, open questions, facts, and captured sources (provided below). Answer using ONLY that context — never invent details. Be concise and direct. If something isn't in the context, say so honestly. The user may ask you to REMEMBER new information or FORGET existing memory; when they do, acknowledge what you recorded or removed and keep your answer short.`;
+const CHAT_SYSTEM = `You are GhostTab's workspace assistant. You have full knowledge of the user's workspace: its goal, decisions, goals, open questions, facts, and captured sources (provided below).
+
+Answer using ONLY that context — never invent details. Be concise and direct. If something isn't in the context, say so honestly. The user may ask you to REMEMBER new information or FORGET existing memory; when they do, acknowledge what you recorded or removed and keep your answer short.
+
+IMPORTANT FORMATTING RULES — you MUST follow these exactly:
+- Respond in plain text only.
+- Do NOT use any markdown. No headings (#), no bold (**), no italics (*), no bullet lists (- or *), no numbered lists, no code fences.
+- Do not use asterisks anywhere.
+- Use simple line breaks for structure when needed.`;
 
 /**
  * Chat with the workspace assistant. Uses the Kilo gateway. Falls back to a
@@ -116,6 +124,81 @@ export async function chatInWorkspace(opts: {
   }
 }
 
+/**
+ * Streaming variant of {@link chatInWorkspace}. Yields incremental plain-text
+ * deltas via `onDelta` (already de-markdowned) and resolves with the final
+ * cleaned text. Falls back to the deterministic local answer when no key is set.
+ */
+export async function chatInWorkspaceStream(
+  opts: {
+    contextText: string;
+    history: ChatTurn[];
+    userMessage: string;
+    apiKey: string;
+    model: string;
+  },
+  onDelta: (partial: string) => void
+): Promise<string> {
+  const { contextText, history, userMessage, apiKey, model } = opts;
+
+  if (!apiKey.trim()) {
+    const text = stripMarkdown(localAnswer(contextText, userMessage));
+    onDelta(text);
+    return text;
+  }
+
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: `${CHAT_SYSTEM}\n\n--- WORKSPACE CONTEXT ---\n${contextText}`,
+    },
+    ...history.map((h) => ({ role: h.role, content: h.content })),
+    { role: "user", content: userMessage },
+  ];
+
+  const run = async (m: string): Promise<string> => {
+    const client = new KiloClient({ apiKey, model: m });
+    let full = "";
+    for await (const delta of client.streamChat(messages, {
+      temperature: 0.6,
+    })) {
+      full += delta;
+      onDelta(stripMarkdown(full));
+    }
+    return stripMarkdown(full);
+  };
+
+  try {
+    return await run(model);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (
+      model !== FALLBACK_MODEL &&
+      /PAID_MODEL_AUTH_REQUIRED|sign in to use this model/i.test(msg)
+    ) {
+      return await run(FALLBACK_MODEL);
+    }
+    throw e;
+  }
+}
+
+/**
+ * Strip any residual markdown from a model response so it renders as clean
+ * plain text: no headings, bold, italics, bullet/numbered lists, or asterisks.
+ */
+export function stripMarkdown(raw: string): string {
+  return raw
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/`{1,3}[^`]*`{1,3}/g, (m) => m.replace(/`/g, ""))
+    .replace(/\*/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 /** Minimal offline answer when no Kilo key is configured. */
 function localAnswer(context: string, question: string): string {
   const q = question.toLowerCase();
@@ -129,19 +212,19 @@ function localAnswer(context: string, question: string): string {
   if (/decision|decided|chose/.test(q)) {
     const d = match();
     return d.length
-      ? `From workspace memory:\n- ${d.join("\n- ")}`
+      ? `From workspace memory:\n${d.join("\n")}`
       : "No decisions found in this workspace yet.";
   }
   if (/question|open|unresolved/.test(q)) {
     const d = match();
     return d.length
-      ? `Open questions:\n- ${d.join("\n- ")}`
+      ? `Open questions:\n${d.join("\n")}`
       : "No open questions recorded.";
   }
   if (/fact|remember|know/.test(q)) {
     const d = match();
     return d.length
-      ? `Known facts:\n- ${d.join("\n- ")}`
+      ? `Known facts:\n${d.join("\n")}`
       : "No facts recorded for this workspace.";
   }
   if (/goal|objective|building|purpose/.test(q)) {

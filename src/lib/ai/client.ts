@@ -86,6 +86,102 @@ export class KiloClient {
       clearTimeout(timeout);
     }
   }
+
+  /**
+   * Streaming completion. Yields incremental content deltas as they arrive.
+   * Falls back to a single one-shot JSON parse if the gateway does not speak
+   * Server-Sent Events (so streaming degrades gracefully instead of breaking).
+   */
+  async *streamChat(
+    messages: ChatMessage[],
+    opts?: { temperature?: number }
+  ): AsyncGenerator<string, void, unknown> {
+    if (!this.apiKey) throw new Error("Missing Kilo API key");
+
+    const body: Record<string, unknown> = {
+      model: this.model,
+      messages,
+      temperature: opts?.temperature ?? 0.3,
+      stream: true,
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000);
+
+    try {
+      const res = await fetch(`${this.baseURL}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`Kilo ${res.status}: ${detail.slice(0, 200)}`);
+      }
+
+      // Graceful fallback: the gateway returned a plain JSON completion
+      // instead of an SSE stream.
+      const ct = res.headers.get("content-type") || "";
+      if (!/text\/event-stream|stream/i.test(ct) || !res.body) {
+        const data = (await res.json()) as {
+          choices?: { message?: { content?: string } }[];
+          error?: { message?: string; code?: string; error_type?: string };
+        };
+        if (data.error) {
+          const detail =
+            data.error.message || data.error.code || data.error.error_type || "unknown error";
+          throw new Error(`Kilo error: ${detail}`);
+        }
+        yield data.choices?.[0]?.message?.content ?? "";
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+
+        let idx: number;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const line = rawEvent
+            .split("\n")
+            .find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") return;
+          try {
+            const json = JSON.parse(data) as {
+              choices?: { delta?: { content?: string } }[];
+              error?: { message?: string; code?: string };
+            };
+            if (json.error) {
+              const msg =
+                json.error.message || json.error.code || "stream error";
+              throw new Error(`Kilo error: ${msg}`);
+            }
+            const delta = json.choices?.[0]?.delta?.content;
+            if (delta) yield delta;
+          } catch (e) {
+            if (e instanceof SyntaxError) continue; // ignore partial chunks
+            throw e;
+          }
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 /** Lightweight connectivity check used by the Settings "Test connection" button. */

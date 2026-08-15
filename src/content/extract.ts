@@ -18,6 +18,21 @@ export function extractPageContext(): PageContext {
   const READABLE_MAX = 4000;
   const HEADING_MAX = 12;
 
+  const safeDomain = (u: string): string | undefined => {
+    try {
+      return new URL(u).hostname.replace(/^www\./, "");
+    } catch {
+      return undefined;
+    }
+  };
+  const metaContent = (name: string): string | undefined => {
+    const el = document.querySelector(
+      `meta[name='${name}'], meta[property='og:${name}'], meta[name='twitter:${name}']`
+    );
+    const c = el?.getAttribute("content");
+    return c && c.trim() ? c.trim().slice(0, 500) : undefined;
+  };
+
   const title = (document.title || "").trim();
   const url = location.href;
   const domain = safeDomain(url);
