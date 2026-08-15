@@ -1,7 +1,7 @@
 // Clean, promise-based storage API for GhostTab.
 // UI code should import from here and never touch IndexedDB directly.
 
-import type { ContextItem, Workspace, WorkspaceState } from "@/types";
+import type { ContextItem, SourceAnalysis, Workspace, WorkspaceState } from "@/types";
 import { uid } from "@/lib/utils/format";
 import {
   openDB,
@@ -44,12 +44,14 @@ export async function getWorkspace(
 export async function createWorkspace(input: {
   name: string;
   goal?: string;
+  currentFocus?: string;
 }): Promise<Workspace> {
   const now = Date.now();
   const ws: Workspace = {
     id: uid("ws"),
     name: input.name,
     goal: input.goal,
+    currentFocus: input.currentFocus ?? "",
     createdAt: now,
     updatedAt: now,
   };
@@ -62,7 +64,7 @@ export async function createWorkspace(input: {
 
 export async function updateWorkspace(
   id: string,
-  patch: Partial<Pick<Workspace, "name" | "goal">>
+  patch: Partial<Pick<Workspace, "name" | "goal" | "currentFocus">>
 ): Promise<Workspace> {
   const db = await openDB();
   const tx = db.transaction(STORE_WORKSPACES, "readwrite");
@@ -207,14 +209,37 @@ export async function resetDemoWorkspace(): Promise<void> {
 // First-run seed (clean demo workspace)
 // ---------------------------------------------------------------------------
 
+/** Minimal clean SourceAnalysis for seeded demo sources (Part 23). */
+function cleanAnalysis(
+  summary: string,
+  relevance: number,
+  extra: Partial<SourceAnalysis> = {}
+): SourceAnalysis {
+  return {
+    summary,
+    keyTopics: [],
+    importantPoints: [],
+    goals: [],
+    decisions: [],
+    questions: [],
+    facts: [],
+    relevance,
+    sourceQuality: relevance >= 0.8 ? "high" : relevance >= 0.5 ? "medium" : "low",
+    memories: [],
+    ...extra,
+  };
+}
+
+/** First-run seed: a clean demo workspace with NO development junk (Part 23). */
 export async function seedStarterIfEmpty(): Promise<void> {
   const existing = await listWorkspaces();
   if (existing.length > 0) return;
 
-  // Clean demo workspace (PART D #34) — no development history.
   const ws = await createWorkspace({
     name: "AI Browser Agent",
-    goal: "Build a browser agent that can continue work across AI tools without losing context.",
+    goal: "Build a browser context layer that lets users continue work across AI tools.",
+    currentFocus:
+      "Design context handoff between ChatGPT and Claude so a captured workspace can be resumed in either tool.",
   });
 
   const now = Date.now();
@@ -226,7 +251,7 @@ export async function seedStarterIfEmpty(): Promise<void> {
     workspaceId: ws.id,
     type: "conversation",
     title: "Architecture discussion",
-    content: "24 messages · ~3.1k words",
+    content: "4 messages · ~320 words",
     source: { url: "https://chatgpt.com/c/abc123", platform: "ChatGPT" },
     messages: [
       { role: "user", text: "I want to build a browser extension that captures context from the pages I work on and lets me continue an AI session in another tool.", index: 0 },
@@ -238,17 +263,18 @@ export async function seedStarterIfEmpty(): Promise<void> {
       "USER\nI want to build a browser extension that captures context from the pages I work on and lets me continue an AI session in another tool.\n\nASSISTANT\nGood framing. The core idea is a local workspace that stores structured memory (decisions, goals, questions) rather than raw page text. Capture should be local-first, and any AI call should send only a compact summary, not the whole page.\n\nUSER\nShould the AI analysis run through a single provider gateway?\n\nASSISTANT\nYes — route analysis through one gateway (Kilo) so the key stays in one place and you can swap models later. Keep memory scoring strict so implementation logs don't leak into durable memory.",
     messageCount: 4,
     createdAt: now - 50 * MIN,
-    analysis: {
-      summary:
-        "Discussion of a local-first browser agent that stores structured memory and routes AI analysis through a single gateway.",
-      relevance: 0.92,
-      memories: [
-        { type: "decision", title: "Use a single AI gateway (Kilo)", content: "Route AI analysis through one provider gateway so the key stays in one place and models can be swapped later.", confidence: 0.9 },
-        { type: "decision", title: "Keep memory local-first", content: "All workspace memory is stored locally; only a compact summary is sent to the AI provider.", confidence: 0.92 },
-        { type: "fact", title: "Capture stores structured memory, not raw page text", content: "The workspace stores structured memory (decisions, goals, questions) rather than dumping raw page content.", confidence: 0.85 },
-        { type: "question", title: "How should context transfer between ChatGPT and Claude?", content: "Open question: how should structured context be transferred reliably between AI tools like ChatGPT and Claude?", confidence: 0.8 },
-      ],
-    },
+    analysis: cleanAnalysis(
+      "Discussion of a local-first browser agent that stores structured memory and routes AI analysis through a single gateway.",
+      0.92,
+      {
+        keyTopics: ["local-first storage", "single AI gateway", "structured memory"],
+        decisions: [
+          "Route AI analysis through a single gateway (Kilo).",
+          "Store workspace memory locally; send only a compact summary to the AI.",
+        ],
+        questions: ["How should context be handed off between ChatGPT and Claude?"],
+      }
+    ),
   };
 
   const githubSrc: ContextItem = {
@@ -260,16 +286,18 @@ export async function seedStarterIfEmpty(): Promise<void> {
       "GhostTab is a Chrome MV3 extension. Architecture: side panel + content scripts + service worker. Context is stored locally in IndexedDB. No backend.",
     source: { url: "https://github.com/acme/ghosttab", platform: "GitHub" },
     createdAt: now - 35 * MIN,
-    analysis: {
-      summary:
-        "GhostTab is a Chrome MV3 extension that stores captured context locally in IndexedDB with a side-panel UI.",
-      relevance: 0.9,
-      memories: [
-        { type: "decision", title: "Use Manifest V3", content: "GhostTab adopts Manifest V3 for the Chrome extension.", confidence: 0.95 },
-        { type: "decision", title: "Store memory in IndexedDB", content: "All workspace memory is persisted locally in IndexedDB.", confidence: 0.95 },
-        { type: "fact", title: "Side panel + content scripts + service worker", content: "GhostTab uses a side panel, content scripts, and a service worker for its architecture.", confidence: 0.85 },
-      ],
-    },
+    analysis: cleanAnalysis(
+      "GhostTab is a Chrome MV3 extension that stores captured context locally in IndexedDB with a side-panel UI.",
+      0.9,
+      {
+        keyTopics: ["Manifest V3", "IndexedDB", "side panel"],
+        decisions: [
+          "Adopt Manifest V3 for the Chrome extension.",
+          "Persist all workspace memory locally in IndexedDB.",
+        ],
+        facts: ["GhostTab uses a side panel, content scripts, and a service worker."],
+      }
+    ),
   };
 
   const chromeDocsSrc: ContextItem = {
@@ -284,15 +312,17 @@ export async function seedStarterIfEmpty(): Promise<void> {
       platform: "Docs",
     },
     createdAt: now - 20 * MIN,
-    analysis: {
-      summary:
-        "Manifest V3 uses service workers instead of background pages and introduces the sidePanel API.",
-      relevance: 0.82,
-      memories: [
-        { type: "fact", title: "MV3 background logic runs in a service worker", content: "In Manifest V3, background logic runs in a service worker.", confidence: 0.85 },
-        { type: "fact", title: "sidePanel API hosts GhostTab's UI", content: "The sidePanel API hosts GhostTab's extension UI.", confidence: 0.85 },
-      ],
-    },
+    analysis: cleanAnalysis(
+      "Manifest V3 uses service workers instead of background pages and introduces the sidePanel API.",
+      0.82,
+      {
+        keyTopics: ["service workers", "sidePanel API", "declarativeNetRequest"],
+        facts: [
+          "In Manifest V3, background logic runs in a service worker.",
+          "The sidePanel API hosts GhostTab's extension UI.",
+        ],
+      }
+    ),
   };
 
   const kiloDocsSrc: ContextItem = {
@@ -304,14 +334,14 @@ export async function seedStarterIfEmpty(): Promise<void> {
       "Kilo exposes an OpenAI-compatible chat gateway. GhostTab sends captured context for analysis and receives structured memory candidates.",
     source: { url: "https://docs.kilo.ai/gateway", platform: "Docs" },
     createdAt: now - 12 * MIN,
-    analysis: {
-      summary:
-        "Kilo is an OpenAI-compatible gateway used by GhostTab for context analysis.",
-      relevance: 0.7,
-      memories: [
-        { type: "fact", title: "Kilo is OpenAI-compatible", content: "Kilo exposes an OpenAI-compatible chat gateway that GhostTab uses for analysis.", confidence: 0.8 },
-      ],
-    },
+    analysis: cleanAnalysis(
+      "Kilo is an OpenAI-compatible gateway used by GhostTab for context analysis.",
+      0.7,
+      {
+        keyTopics: ["OpenAI-compatible gateway", "memory analysis"],
+        facts: ["Kilo exposes an OpenAI-compatible chat gateway that GhostTab uses for analysis."],
+      }
+    ),
   };
 
   const memory: ContextItem[] = [
@@ -319,23 +349,23 @@ export async function seedStarterIfEmpty(): Promise<void> {
       id: uid("c"),
       workspaceId: ws.id,
       type: "goal",
-      title: "Build a universal browser context layer",
-      content: "Build a universal browser context layer so AI tools share memory instead of starting from scratch.",
+      title: "Build a browser context layer",
+      content: "Build a browser context layer that lets users continue work across AI tools.",
       createdAt: now - 3 * HR,
     },
     {
       id: uid("c"),
       workspaceId: ws.id,
       type: "decision",
-      title: "Use Chrome MV3",
-      content: "Adopt Manifest V3 for the Chrome extension.",
+      title: "Context belongs to the user",
+      content: "Captured context and memory belong to the user, not to any single AI tool.",
       createdAt: now - 2 * HR,
     },
     {
       id: uid("c"),
       workspaceId: ws.id,
       type: "decision",
-      title: "Keep workspace memory local-first",
+      title: "Use local-first workspace storage",
       content: "Persist all workspace memory locally; never send raw history to a provider.",
       createdAt: now - 2 * HR + MIN,
     },
@@ -343,7 +373,7 @@ export async function seedStarterIfEmpty(): Promise<void> {
       id: uid("c"),
       workspaceId: ws.id,
       type: "decision",
-      title: "Use Kilo for AI analysis",
+      title: "Use Kilo for AI understanding",
       content: "Route AI analysis through the Kilo gateway.",
       createdAt: now - 2 * HR + 2 * MIN,
     },
@@ -351,24 +381,24 @@ export async function seedStarterIfEmpty(): Promise<void> {
       id: uid("c"),
       workspaceId: ws.id,
       type: "question",
-      title: "How should context transfer between AI tools reliably?",
-      content: "How should structured context be transferred between ChatGPT and Claude reliably?",
+      title: "How should cross-AI context be handed off?",
+      content: "How should structured context be handed off reliably between ChatGPT and Claude?",
       createdAt: now - 40 * MIN,
     },
     {
       id: uid("c"),
       workspaceId: ws.id,
       type: "fact",
-      title: "ChatGPT and Claude conversations can be captured",
-      content: "GhostTab can capture full ChatGPT and Claude conversations locally.",
+      title: "Browser pages can be captured into workspaces",
+      content: "GhostTab can capture browser pages into a workspace as clean source documents.",
       createdAt: now - 30 * MIN,
     },
     {
       id: uid("c"),
       workspaceId: ws.id,
       type: "fact",
-      title: "Workspace context is stored locally",
-      content: "All captured context and memory lives in this browser's local storage.",
+      title: "Conversations are ordered messages",
+      content: "ChatGPT and Claude conversations can be represented as ordered user/assistant messages.",
       createdAt: now - 25 * MIN,
     },
   ];
@@ -383,4 +413,47 @@ export async function seedStarterIfEmpty(): Promise<void> {
 
   for (const it of items) await addContextItem(it);
   await setWorkspaceState({ workspaceId: ws.id, activeTabIds: [] });
+}
+
+// ---------------------------------------------------------------------------
+// Memory cleanup (Part 22)
+// ---------------------------------------------------------------------------
+
+/** A deterministic blacklist for obvious junk memory (Part 22). */
+const REPROCESS_BLACKLIST: RegExp[] = [
+  /\bphase\s*[1-9]\b/i,
+  /build succeeded/i,
+  /npm run build/i,
+  /typescript error/i,
+  /chrome extension loaded/i,
+  /account user/i,
+  /good to see you/i,
+  /\bchrome:\/\//i,
+  /you said/i,
+  /phase \d+ (complete|done)/i,
+  /development status/i,
+];
+
+/**
+ * Rescan existing workspace memory through the new quality rules and drop
+ * obvious junk. NEVER deletes raw source documents — only durable memory
+ * items whose title/content matches the blacklist (Part 22). Safe to run on
+ * demand from Settings; not called automatically on startup.
+ */
+export async function reprocessWorkspaceMemory(
+  workspaceId: string
+): Promise<number> {
+  const items = await getContextItems(workspaceId);
+  const memory = items.filter((i) =>
+    ["decision", "goal", "question", "fact"].includes(i.type)
+  );
+  let removed = 0;
+  for (const m of memory) {
+    const hay = `${m.title} ${m.content}`.toLowerCase();
+    if (REPROCESS_BLACKLIST.some((re) => re.test(hay))) {
+      await removeContextItem(m.id);
+      removed++;
+    }
+  }
+  return removed;
 }

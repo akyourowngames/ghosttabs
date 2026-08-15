@@ -1,4 +1,12 @@
-import type { PageContext } from "@/types";
+import type {
+  ConversationContext,
+  PageContext,
+  SourceDocument,
+  SourceType,
+  SourceSection,
+  SourceLink,
+  SourceCodeBlock,
+} from "@/types";
 
 /**
  * Collect structured, useful context from the current page without
@@ -12,6 +20,7 @@ export function extractPageContext(): PageContext {
 
   const title = (document.title || "").trim();
   const url = location.href;
+  const domain = safeDomain(url);
 
   const headings: string[] = [];
   document.querySelectorAll("h1, h2, h3").forEach((h) => {
@@ -55,7 +64,92 @@ export function extractPageContext(): PageContext {
     ? selectedText.slice(0, READABLE_MAX)
     : readable.slice(0, READABLE_MAX);
 
-  return { title, url, headings, readableText, selectedText };
+  const description = metaContent("description");
+
+  return { title, url, domain, description, headings, readableText, selectedText };
+}
+
+function safeDomain(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
+}
+
+function metaContent(name: string): string | undefined {
+  const el = document.querySelector(
+    `meta[name='${name}'], meta[property='og:${name}'], meta[name='twitter:${name}']`
+  );
+  const c = el?.getAttribute("content");
+  return c && c.trim() ? c.trim().slice(0, 500) : undefined;
+}
+
+/**
+ * Deep, clean webpage extraction (Parts 2–4). Produces a {@link SourceDocument}
+ * with metadata, semantic sections, links, and code blocks — never raw DOM.
+ * Best-effort and resilient: if nothing meaningful is found it returns an empty
+ * document rather than throwing.
+ */
+export function extractPageDocument(
+  workspaceId: string,
+  sourceType: SourceType = "webpage"
+): SourceDocument {
+  const title = (document.title || "").trim();
+  const url = location.href;
+  const domain = safeDomain(url);
+  const description = metaContent("description");
+
+  const headings: string[] = [];
+  document.querySelectorAll("h1, h2, h3").forEach((h) => {
+    const t = (h.textContent || "").trim();
+    if (t) headings.push(t);
+  });
+
+  const selection = window.getSelection();
+  const selectedText =
+    selection && !selection.isCollapsed
+      ? selection.toString().trim() || undefined
+      : undefined;
+
+  // Prefer the highest-scoring semantic container, then walk it into sections.
+  const candidates = Array.from(
+    document.querySelectorAll("article, main, [role='main'], .markdown-body, .md, .content, #content, .post, body")
+  ).filter((el) => (el.textContent || "").replace(/\s+/g, " ").trim().length > 120);
+
+  let best: Element = document.body;
+  let bestScore = -Infinity;
+  for (const el of candidates) {
+    const s = ctScore(el);
+    if (s > bestScore) {
+      bestScore = s;
+      best = el;
+    }
+  }
+
+  const sections: SourceSection[] = ctSections(best);
+  const text = sections.map((s) => (s.heading ? `${s.heading}\n\n${s.content}` : s.content)).join("\n\n");
+  const links: SourceLink[] = ctLinks(best);
+  const codeBlocks: SourceCodeBlock[] = ctCode(best);
+
+  return {
+    id: `sd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    workspaceId,
+    sourceType,
+    title: title || domain || "Page",
+    url,
+    domain,
+    description,
+    headings: headings.slice(0, 24),
+    sections,
+    text: text.slice(0, 60_000),
+    links,
+    codeBlocks,
+    selectedText,
+    wordCount: text ? text.split(/\s+/).length : 0,
+    capturedAt: Date.now(),
+    captureStatus: "complete",
+  };
 }
 
 /**
@@ -67,15 +161,7 @@ export function extractPageContext(): PageContext {
  * stays self-contained. The canonical, modular version lives in
  * src/content/platforms/* (used by the content-script message path).
  */
-export async function extractConversationContext(): Promise<{
-  platform: "chatgpt" | "claude" | "generic";
-  title: string;
-  url: string;
-  messages: { role: "user" | "assistant" | "unknown"; text: string; index: number }[];
-  fullText: string;
-  messageCount: number;
-  selectedText?: string;
-}> {
+export async function extractConversationContext(): Promise<ConversationContext> {
   const SAFEGUARDS = {
     maxMessages: 500,
     maxChars: 80_000,
@@ -111,7 +197,20 @@ export async function extractConversationContext(): Promise<{
         ].join(",")
       )
       .forEach((n) => n.remove());
-    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+    // Drop control characters that can corrupt the payload / model input.
+    return (clone.textContent || "")
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  // A turn with no readable text but an image (e.g. a generated image) is
+  // still meaningful — represent it so the turn isn't dropped.
+  const imageAwareText = (turn: Element): string => {
+    const t = cleanText(turn);
+    if (t.length >= 2) return t;
+    if (turn.querySelector("img")) return "[image]";
+    return t;
   };
 
   const normalizeKey = (role: string, text: string): string =>
@@ -162,14 +261,14 @@ export async function extractConversationContext(): Promise<{
     const roots = main ? [main] : [document];
     for (const root of roots) {
       for (const a of Array.from(root.querySelectorAll("article"))) {
-        const text = cleanText(a);
+        const text = imageAwareText(a);
         if (text.length < 2) continue;
         out.push({ role: roleOf(a), text });
       }
     }
     if (out.length === 0) {
       for (const n of Array.from(document.querySelectorAll("[data-message-author-role]"))) {
-        const text = cleanText(n);
+        const text = imageAwareText(n);
         if (text.length < 2) continue;
         const r = n.getAttribute("data-message-author-role");
         out.push({ role: r === "user" || r === "assistant" ? r : "unknown", text });
@@ -203,7 +302,7 @@ export async function extractConversationContext(): Promise<{
       return "unknown";
     };
     for (const t of Array.from(document.querySelectorAll("[data-testid='conversation-turn']"))) {
-      const text = cleanText(t);
+      const text = imageAwareText(t);
       if (text.length < 2) continue;
       out.push({ role: roleOf(t), text });
     }
@@ -213,7 +312,7 @@ export async function extractConversationContext(): Promise<{
         ".font-user-message, .font-claude-message, [data-testid='user-message'], [data-testid='assistant-message']"
       )
     )) {
-      const text = cleanText(b);
+      const text = imageAwareText(b);
       if (text.length < 2) continue;
       out.push({ role: roleOf(b), text });
     }
@@ -221,7 +320,7 @@ export async function extractConversationContext(): Promise<{
     const main = document.querySelector("main");
     if (main) {
       for (const a of Array.from(main.querySelectorAll("article"))) {
-        const text = cleanText(a);
+        const text = imageAwareText(a);
         if (text.length < 2) continue;
         out.push({ role: roleOf(a), text });
       }
@@ -315,7 +414,8 @@ export async function extractConversationContext(): Promise<{
       if (firstUser) title = firstUser.text.slice(0, 90);
     }
     const fullText = messages.map((m) => `${m.role.toUpperCase()}\n${m.text}`).join("\n\n");
-    return { platform: "chatgpt", title, url, messages, fullText, messageCount: messages.length };
+    const wc = fullText ? fullText.split(/\s+/).length : 0;
+    return { platform: "chatgpt", isConversation: messages.length >= 2, title, url, messages, fullText, messageCount: messages.length, wordCount: wc, captureStatus: messages.length >= 2 ? "partial" : "complete" };
   }
 
   if (platform === "claude") {
@@ -326,7 +426,8 @@ export async function extractConversationContext(): Promise<{
       if (firstUser) title = firstUser.text.slice(0, 90);
     }
     const fullText = messages.map((m) => `${m.role.toUpperCase()}\n${m.text}`).join("\n\n");
-    return { platform: "claude", title, url, messages, fullText, messageCount: messages.length };
+    const wc = fullText ? fullText.split(/\s+/).length : 0;
+    return { platform: "claude", isConversation: messages.length >= 2, title, url, messages, fullText, messageCount: messages.length, wordCount: wc, captureStatus: messages.length >= 2 ? "partial" : "complete" };
   }
 
   // Generic page.
@@ -344,11 +445,114 @@ export async function extractConversationContext(): Promise<{
   if (!readable) readable = cleanText(document.body);
   return {
     platform: "generic",
+    isConversation: false,
     title: (document.title || "").trim(),
     url,
     messages: [],
     fullText: readable,
     messageCount: 0,
+    wordCount: readable ? readable.split(/\s+/).length : 0,
+    captureStatus: "complete",
     selectedText,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained readability helpers for extractPageDocument().
+// These mirror src/content/platforms/generic.ts but are inlined here because
+// extractPageDocument() is injected via chrome.scripting.executeScript and
+// cannot use module-scope imports at injection time.
+// ---------------------------------------------------------------------------
+
+function ctScore(el: Element): number {
+  let score = 0;
+  const tag = el.tagName.toLowerCase();
+  const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  if (tag === "article" || tag === "main") score += 6;
+  if (el.getAttribute("role") === "main") score += 6;
+  if (tag === "section") score += 2;
+  if (words >= 40) score += 4;
+  if (words >= 120) score += 4;
+  if (el.querySelector("p, li, blockquote, pre, table")) score += 3;
+  if (el.querySelector("h1, h2, h3")) score += 2;
+  if (el.querySelector("pre, code")) score += 2;
+  const hay = `${el.className || ""} ${el.id || ""} ${(el.getAttribute("role") || "")}`.toLowerCase();
+  if (/nav|menu|sidebar|footer|cookie|banner|ad-|ads|advert|newsletter|subscribe|signup|login|social|share|recommend|comment|widget|toolbar|breadcrumb|pagination/i.test(hay)) score -= 12;
+  return score;
+}
+
+function ctClean(el: Element | null): string {
+  if (!el) return "";
+  const clone = el.cloneNode(true) as Element;
+  clone
+    .querySelectorAll(
+      "script,style,noscript,button,[role='button'],svg,nav,header,aside,footer,form,input,[data-testid*='copy'],[data-testid*='retry'],[data-testid*='share'],[class*='sidebar'],[class*='cookie'],[class*='banner'],[class*='ads']"
+    )
+    .forEach((n) => n.remove());
+  return (clone.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function ctIsJunk(el: Element): boolean {
+  const tag = el.tagName.toLowerCase();
+  if (["nav", "footer", "aside", "header", "form"].includes(tag)) return true;
+  const hay = `${el.className || ""} ${el.id || ""} ${(el.getAttribute("role") || "")}`.toLowerCase();
+  return /nav|menu|sidebar|footer|cookie|banner|ad-|ads|advert|newsletter|subscribe|signup|login|social|share|recommend|comment|widget|toolbar|breadcrumb|pagination/i.test(hay) || (el.getAttribute("role") || "") === "navigation";
+}
+
+function ctSections(root: Element): SourceSection[] {
+  const sections: SourceSection[] = [];
+  const blocks = Array.from(
+    root.querySelectorAll("h1, h2, h3, h4, p, ul, ol, blockquote, pre, table")
+  );
+  let current: SourceSection | null = null;
+  for (const b of blocks) {
+    if (ctIsJunk(b)) continue;
+    const tag = b.tagName.toLowerCase();
+    if (/^h[1-4]$/.test(tag)) {
+      if (current && current.content.trim()) sections.push(current);
+      current = { heading: (b.textContent || "").trim().slice(0, 200), content: "" };
+    } else {
+      const txt = ctClean(b);
+      if (!txt) continue;
+      if (!current) current = { content: "" };
+      current.content += (current.content ? "\n\n" : "") + txt;
+    }
+  }
+  if (current && current.content.trim()) sections.push(current);
+  const filtered = sections
+    .map((s) => ({ heading: s.heading, content: s.content.trim().slice(0, 6000) }))
+    .filter((s) => s.content.length > 0);
+  return filtered.length ? filtered : [{ content: ctClean(root).slice(0, 6000) }];
+}
+
+function ctLinks(root: Element): SourceLink[] {
+  const out: SourceLink[] = [];
+  const seen = new Set<string>();
+  for (const a of Array.from(root.querySelectorAll("a[href]"))) {
+    if (ctIsJunk(a)) continue;
+    const text = (a.textContent || "").replace(/\s+/g, " ").trim();
+    const href = (a.getAttribute("href") || "").trim();
+    if (text.length < 3 || !href || href.startsWith("#")) continue;
+    if (/^(javascript:|mailto:|tel:)/i.test(href)) continue;
+    if (/\b(sign up|sign in|log in|subscribe|cookie|privacy policy|terms of service|accept)\b/i.test(text)) continue;
+    const key = `${text.toLowerCase()}|${href}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ text: text.slice(0, 160), url: href });
+    if (out.length >= 30) break;
+  }
+  return out;
+}
+
+function ctCode(root: Element): SourceCodeBlock[] {
+  const out: SourceCodeBlock[] = [];
+  for (const b of Array.from(root.querySelectorAll("pre, code, [class*='highlight'], [class*='code-block']"))) {
+    const code = (b.textContent || "").replace(/\s+/g, " ").trim();
+    if (code.length < 12) continue;
+    const m = (b.className || "").toString().match(/language-([a-z0-9+#]+)/i);
+    out.push({ language: m ? m[1].toLowerCase() : undefined, code: code.slice(0, 4000) });
+    if (out.length >= 40) break;
+  }
+  return out;
 }

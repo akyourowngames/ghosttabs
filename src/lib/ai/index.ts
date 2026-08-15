@@ -1,80 +1,104 @@
 import type {
   AnalyzeContextInput,
-  ContextAnalysis,
+  ApprovedMemory,
   ContextItem,
-  MemoryCandidate,
   MemoryType,
+  SourceAnalysis,
 } from "@/types";
 import { uid } from "@/lib/utils/format";
-import { KiloClient, FALLBACK_MODEL, type KiloClientOptions } from "./client";
+import { KiloClient, type KiloClientOptions } from "./client";
 import { buildAnalysisMessages } from "./prompts";
-import { normalizeForDedupe, parseContextAnalysis } from "./extract";
-import { localCurate } from "./local";
+import { normalizeForDedupe, parseSourceAnalysis } from "./extract";
 
-export { localCurate } from "./local";
 export type { AnalyzeContextInput, ContextAnalysis, MemoryCandidate } from "@/types";
-export { parseContextAnalysis, extractJson, validateMemoryCandidates } from "./extract";
+export { localCurate } from "./local";
+export {
+  parseSourceAnalysis,
+  extractJson,
+  validateApprovedMemories,
+  validateMemoryCandidates,
+} from "./extract";
 
-/** Confidence threshold: below this, an item is an AI observation, not durable memory. */
-export const MEMORY_CONFIDENCE_THRESHOLD = 0.6;
+/** Confidence threshold: below this, an item is an AI observation, not memory. */
+export const MEMORY_CONFIDENCE_THRESHOLD = 0.75;
 
 export interface AnalyzeOptions extends KiloClientOptions {}
 
 /**
  * Run the Memory Curator analysis against a captured source.
- * Returns both the parsed analysis (null if unparseable) and the RAW model
- * response so the UI can show exactly what the model said.
+ * Returns both the parsed {@link SourceAnalysis} (null if unparseable) and the
+ * RAW model response so the UI can show exactly what the model returned.
  */
 export async function analyzeContext(
   input: AnalyzeContextInput,
   opts: AnalyzeOptions
-): Promise<{ analysis: ContextAnalysis | null; raw: string }> {
+): Promise<{ analysis: SourceAnalysis | null; raw: string; approved: ApprovedMemory[] }> {
   const client = new KiloClient(opts);
   const messages = buildAnalysisMessages(input);
-  try {
-    const raw = await client.chat(messages, { json: true, temperature: 0.2 });
-    return { analysis: parseContextAnalysis(raw), raw };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    // Auto-recover: if the chosen model needs a signed-in (paid) account,
-    // retry transparently with the free fallback model so capture still works.
-    if (
-      opts.model &&
-      opts.model !== FALLBACK_MODEL &&
-      /PAID_MODEL_AUTH_REQUIRED|sign in to use this model/i.test(msg)
-    ) {
-      const fb = new KiloClient({ ...opts, model: FALLBACK_MODEL });
-      const raw = await fb.chat(messages, { json: true, temperature: 0.2 });
-      return {
-        analysis: parseContextAnalysis(raw),
-        raw: `[auto-fallback to ${FALLBACK_MODEL}]\n` + raw,
-      };
-    }
-    throw e;
-  }
+  const raw = await client.chat(messages, { json: true, temperature: 0.2 });
+  const analysis = parseSourceAnalysis(raw);
+  return {
+    analysis,
+    raw,
+    approved: analysis ? filterApproved(analysis, input) : [],
+  };
+}
+
+/** Extract approved (durable) memories from a parsed analysis. */
+function filterApproved(
+  analysis: SourceAnalysis,
+  input: AnalyzeContextInput
+): ApprovedMemory[] {
+  // Prefer explicit approvedMemories; fall back to validated legacy memories.
+  const fromApproved = (analysis as unknown as { approvedMemories?: ApprovedMemory[] })
+    .approvedMemories;
+  const pool: ApprovedMemory[] = Array.isArray(fromApproved)
+    ? fromApproved
+    : analysis.memories.map((m) => ({
+        type: m.type,
+        title: m.title,
+        content: m.content,
+        confidence: m.confidence,
+      }));
+
+  return pool
+    .filter(
+      (m) =>
+        m.confidence >= MEMORY_CONFIDENCE_THRESHOLD &&
+        !isDuplicateOfExisting(m, input.existingMemory)
+    )
+    .slice(0, 24);
+}
+
+function isDuplicateOfExisting(
+  m: ApprovedMemory,
+  existing?: string[]
+): boolean {
+  if (!existing || !existing.length) return false;
+  const key = normalizeForDedupe(m.title);
+  return existing.some((e) => normalizeForDedupe(e).includes(key));
 }
 
 /**
- * Convert the durable memories (confidence >= threshold, de-duplicated) into
- * standalone workspace memory items. Lower-confidence candidates remain
- * attached to the source as AI observations and are NOT returned here.
+ * Convert approved durable memories into standalone workspace memory items
+ * (Part 21: MEMORY is its own stage). Lower-confidence items stay attached to
+ * the source as AI observations and are NOT returned here.
  */
 export function convertMemoriesToItems(
-  analysis: ContextAnalysis,
+  approved: ApprovedMemory[],
   workspaceId: string,
   sourceUrl?: string,
   existing: ContextItem[] = []
 ): ContextItem[] {
   const items: ContextItem[] = [];
-  for (const m of analysis.memories) {
-    if (m.confidence < MEMORY_CONFIDENCE_THRESHOLD) continue; // observation only
+  for (const m of approved) {
     items.push(buildMemoryItem(m, workspaceId, sourceUrl));
   }
   return dedupeAgainstExisting(items, existing);
 }
 
 function buildMemoryItem(
-  m: MemoryCandidate,
+  m: ApprovedMemory,
   workspaceId: string,
   sourceUrl?: string
 ): ContextItem {
@@ -108,17 +132,33 @@ export function dedupeAgainstExisting(
 }
 
 /**
- * Local curator fallback used when no Kilo key is configured or the AI call
- * fails. Guarantees the workspace gains at least some memory instead of
- * nothing, and is clearly labeled as local (never a model response).
+ * Dev fallback used only when no Kilo API key is configured. Clearly marked,
+ * and intentionally produces NO durable memory (we never invent user data).
  */
 export function devFallbackAnalysis(input: AnalyzeContextInput): {
-  analysis: ContextAnalysis;
+  analysis: SourceAnalysis;
   raw: string;
+  approved: ApprovedMemory[];
 } {
-  const analysis = localCurate(input);
+  console.warn("[GhostTab] dev fallback: no Kilo API key — skipping memory extraction.");
+  const firstSentence = (input.source.content || "")
+    .split(/(?<=[.!?])\s+/)[0]
+    ?.slice(0, 240);
+  const analysis: SourceAnalysis = {
+    summary: firstSentence || input.source.title,
+    keyTopics: [],
+    importantPoints: [],
+    goals: [],
+    decisions: [],
+    questions: [],
+    facts: [],
+    relevance: input.workspace.goal ? 0.55 : 0.45,
+    sourceQuality: "low",
+    memories: [],
+  };
   return {
     analysis,
-    raw: "[local extraction — no API call]\n" + JSON.stringify(analysis, null, 2),
+    raw: "[dev fallback] No Kilo API key configured — memory extraction skipped.",
+    approved: [],
   };
 }

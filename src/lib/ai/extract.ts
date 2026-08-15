@@ -1,47 +1,80 @@
-import type { ContextAnalysis, MemoryCandidate } from "@/types";
+import type {
+  ApprovedMemory,
+  MemoryCandidate,
+  SourceAnalysis,
+} from "@/types";
 
 /** Pull a JSON object out of a model response, tolerating fences / prose. */
 export function extractJson(text: string): unknown {
   if (!text) return null;
+  const tryParse = (s: string): unknown | null => {
+    try {
+      const v = JSON.parse(s);
+      return v && typeof v === "object" ? v : null;
+    } catch {
+      return null;
+    }
+  };
 
-  // 1. Direct parse.
-  try {
-    return JSON.parse(text);
-  } catch {
-    // fall through
-  }
+  const direct = tryParse(text);
+  if (direct) return direct;
 
-  // 2. Strip ```json fences.
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) {
-    try {
-      return JSON.parse(fenced[1]);
-    } catch {
-      // fall through
-    }
+    const f = tryParse(fenced[1]);
+    if (f) return f;
   }
 
-  // 3. Extract the first {...} object from surrounding prose.
   const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start !== -1 && end > start) {
-    try {
-      return JSON.parse(text.slice(start, end + 1));
-    } catch {
-      // fall through
+  if (start !== -1) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = !inStr;
+        continue;
+      }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const obj = tryParse(text.slice(start, i + 1));
+          if (obj) return obj;
+          break;
+        }
+      }
     }
   }
 
   return null;
 }
 
-/** Limit text sent to the model (spec targets ~8k–12k useful chars). */
+/** Remove control characters that can break JSON / models. */
+export function sanitizeText(s: string): string {
+  return (s || "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Limit text sent to the model. */
 export function truncateForAnalysis(text: string, max = 10_000): string {
   if (text.length <= max) return text;
   return text.slice(0, max) + "\n…[truncated]";
 }
 
-/** Normalize for duplicate detection (no semantic similarity yet). */
+/** Normalize for duplicate detection. */
 export function normalizeForDedupe(value: string): string {
   return value
     .toLowerCase()
@@ -51,11 +84,11 @@ export function normalizeForDedupe(value: string): string {
 }
 
 /**
- * Second quality filter. A small, purposeful blacklist applied AFTER the
- * model returns candidates. The primary defense remains the system prompt;
- * this is a deterministic safety net for obvious noise patterns.
+ * Deterministic safety net applied AFTER the model returns candidates. The
+ * primary defense is the strict system prompt; this blacklist catches obvious
+ * noise (phase labels, build logs, greetings, account metadata).
  */
-const MEMORY_BLACKLIST: RegExp[] = [
+const JUNK_BLACKLIST: RegExp[] = [
   /\bphase\s*[1-9]\b/i,
   /build succeeded/i,
   /typescript error/i,
@@ -64,19 +97,25 @@ const MEMORY_BLACKLIST: RegExp[] = [
   /account user/i,
   /good to see you/i,
   /development status/i,
+  /\bchrome:\/\//i,
+  /you said/i,
+  /phase \d+ (complete|done)/i,
 ];
 
 /** Allowed durable memory types. */
 export const MEMORY_TYPES = new Set(["decision", "goal", "question", "fact"]);
 
+/** Confidence threshold: below this, an item is an AI observation, not memory. */
+export const MEMORY_CONFIDENCE_THRESHOLD = 0.75;
+
 /**
- * Validate + filter raw model output into clean memory candidates.
- * Rejects malformed items and obvious noise (blacklist). Lower confidence
- * items are kept here (they become AI observations, not durable memory).
+ * Validate + filter raw model output into approved durable memories (Part 14).
+ * Rejects malformed items, wrong types, and obvious noise. The `reason` field
+ * is retained for debugging but must NOT be shown in the user UI.
  */
-export function validateMemoryCandidates(raw: unknown): MemoryCandidate[] {
+export function validateApprovedMemories(raw: unknown): ApprovedMemory[] {
   if (!Array.isArray(raw)) return [];
-  const out: MemoryCandidate[] = [];
+  const out: ApprovedMemory[] = [];
   for (const c of raw) {
     if (!c || typeof c !== "object") continue;
     const o = c as Record<string, unknown>;
@@ -95,25 +134,41 @@ export function validateMemoryCandidates(raw: unknown): MemoryCandidate[] {
     if (!Number.isFinite(confidence)) confidence = 0.5;
     confidence = Math.max(0, Math.min(1, confidence));
 
+    const reason = o.reason ? String(o.reason).slice(0, 400) : undefined;
+
     const hay = (title + " " + content).toLowerCase();
-    if (MEMORY_BLACKLIST.some((re) => re.test(hay))) continue;
+    if (JUNK_BLACKLIST.some((re) => re.test(hay))) continue;
 
     out.push({
-      type: type as MemoryCandidate["type"],
+      type: type as ApprovedMemory["type"],
       title,
       content,
       confidence,
+      reason,
     });
   }
   return out;
 }
 
 /**
- * Parse the model response into a structured ContextAnalysis. Returns null
- * only when the JSON is malformed beyond recovery. Memory candidates are
+ * Backwards-compatible candidate memory filter. Used only when a model returns
+ * the legacy `memories` array. Kept for existing stored analyses.
+ */
+export function validateMemoryCandidates(raw: unknown): MemoryCandidate[] {
+  return validateApprovedMemories(raw).map((m) => ({
+    type: m.type,
+    title: m.title,
+    content: m.content,
+    confidence: m.confidence,
+  }));
+}
+
+/**
+ * Parse the model response into a structured {@link SourceAnalysis}. Returns
+ * null only when the JSON is malformed beyond recovery. Approved memories are
  * validated/filtered here.
  */
-export function parseContextAnalysis(raw: string): ContextAnalysis | null {
+export function parseSourceAnalysis(raw: string): SourceAnalysis | null {
   const data = extractJson(raw) as Record<string, unknown> | null;
   if (!data || typeof data !== "object") return null;
 
@@ -121,10 +176,53 @@ export function parseContextAnalysis(raw: string): ContextAnalysis | null {
   if (!Number.isFinite(relevance)) relevance = 0.5;
   relevance = Math.max(0, Math.min(1, relevance));
 
+  const qualityRaw = String(data.sourceQuality ?? "medium").toLowerCase();
+  const sourceQuality: SourceAnalysis["sourceQuality"] =
+    qualityRaw === "high" || qualityRaw === "low" ? qualityRaw : "medium";
+
   const summary = String(data.summary ?? "").trim();
+  const keyTopics = asStringArray(data.keyTopics);
+  const importantPoints = asStringArray(data.importantPoints);
+  const goals = asStringArray(data.goals);
+  const decisions = asStringArray(data.decisions);
+  const questions = asStringArray(data.questions);
+  const facts = asStringArray(data.facts);
+
+  const approved = validateApprovedMemories(
+    (data as { approvedMemories?: unknown }).approvedMemories
+  );
   const memories = validateMemoryCandidates(
     (data as { memories?: unknown }).memories
   );
 
-  return { summary, relevance, memories };
+  return {
+    summary,
+    keyTopics,
+    importantPoints,
+    goals,
+    decisions,
+    questions,
+    facts,
+    relevance,
+    sourceQuality,
+    memories: approved.length ? memoriesFromApproved(approved).concat(memories) : memories,
+  };
+}
+
+/** Convert approved memories into the legacy candidate shape for storage. */
+function memoriesFromApproved(approved: ApprovedMemory[]): MemoryCandidate[] {
+  return approved.map((m) => ({
+    type: m.type,
+    title: m.title,
+    content: m.content,
+    confidence: m.confidence,
+  }));
+}
+
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((x) => String(x ?? "").trim())
+    .filter((x) => x.length > 0 && x.length <= 600)
+    .slice(0, 24);
 }

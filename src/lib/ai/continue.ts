@@ -1,15 +1,12 @@
-import type { ContextItem } from "@/types";
-import { CONTINUATION_SYSTEM_PROMPT } from "./prompts";
-
-export interface ContinuationInput {
-  workspace: { name: string; goal?: string };
-  /** Durable memory items: decision / goal / question / fact. */
-  memories: ContextItem[];
-  /** Recent captured sources: page / conversation / snippet. */
-  recentSources: ContextItem[];
-  /** Recent activity timeline entries. */
-  recentActivity: { title: string; at: number }[];
-}
+import type {
+  ApprovedMemory,
+  ContextItem,
+  ContinuationInputState,
+  RelevantSourceSummary,
+  SourceAnalysis,
+} from "@/types";
+import { KiloClient, type KiloClientOptions } from "./client";
+import { buildContinuationMessages } from "./prompts";
 
 export interface ContinuationPacket {
   text: string;
@@ -19,6 +16,7 @@ export interface ContinuationPacket {
   factCount: number;
   sourceCount: number;
   estimatedTokens: number;
+  usedAI: boolean;
 }
 
 /** Rough token estimate (~4 chars per token). */
@@ -26,53 +24,110 @@ export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function byRecency(a: ContextItem, b: ContextItem): number {
-  return b.createdAt - a.createdAt;
+const MEMORY_TYPES = new Set(["decision", "goal", "question", "fact"]);
+
+/**
+ * Build the curated inputs the continuation generator is ALLOWED to consume
+ * (Part 15). It reads ONLY:
+ *   - workspace.goal + workspace.currentFocus
+ *   - approved (durable) memories
+ *   - top-5 relevant source *summaries* (never raw source text or activity)
+ */
+export function buildContinuationState(
+  workspace: { name: string; goal?: string; currentFocus?: string },
+  memories: ContextItem[],
+  sources: ContextItem[]
+): ContinuationInputState {
+  const approved: ApprovedMemory[] = memories
+    .filter((i) => MEMORY_TYPES.has(i.type))
+    .map((i) => ({
+      type: i.type as ApprovedMemory["type"],
+      title: i.title,
+      content: i.content,
+      confidence: 0.8,
+    }));
+
+  // Top-5 relevant sources by relevance, then recency (Parts 16–17).
+  const relevantSources: RelevantSourceSummary[] = sources
+    .filter((s) => (s.analysis?.relevance ?? 0) >= 0.4)
+    .sort(
+      (a, b) =>
+        (b.analysis?.relevance ?? 0) - (a.analysis?.relevance ?? 0) ||
+        b.createdAt - a.createdAt
+    )
+    .slice(0, 5)
+    .map((s) => ({
+      title: s.title || s.source?.url || "Source",
+      summary: continuationSummary(s.analysis),
+      url: s.source?.url,
+    }));
+
+  return {
+    workspace: {
+      name: workspace.name,
+      goal: workspace.goal,
+      currentFocus: workspace.currentFocus,
+    },
+    approvedMemories: approved,
+    relevantSources,
+  };
+}
+
+function continuationSummary(a?: SourceAnalysis): string {
+  if (!a) return "";
+  return (a.summary || a.keyTopics.join(", ") || "").split("\n")[0].slice(0, 220);
 }
 
 /**
- * Build a compact continuation packet from workspace memory + recent source
- * summaries. Deterministic and reliable — it never resends full page contents,
- * only workspace memory and one-line source summaries (Phase 6 security rule).
- *
- * An optional AI compression step can use CONTINUATION_SYSTEM_PROMPT, but the
- * deterministic assembly is the default for reliability.
+ * Generate the continuation packet. The deterministic assembly is the default
+ * and never includes raw source text, activity, or dev logs (Part 20). When a
+ * Kilo key is configured, an AI compressor tightens it using ONLY the curated
+ * state (Part 19).
  */
-export function generateContinuationContext(input: ContinuationInput): ContinuationPacket {
-  const lines: string[] = [];
+export async function generateContinuationContext(
+  state: ContinuationInputState,
+  opts?: KiloClientOptions
+): Promise<ContinuationPacket> {
+  const deterministic = assembleDeterministic(state);
 
-  const decisions = input.memories
-    .filter((i) => i.type === "decision")
-    .sort(byRecency);
-  const goals = input.memories.filter((i) => i.type === "goal").sort(byRecency);
-  const questions = input.memories
-    .filter((i) => i.type === "question")
-    .sort(byRecency);
-  const facts = input.memories.filter((i) => i.type === "fact").sort(byRecency);
-
-  // Only top-relevant sources, capped. Recent activity is NOT included — the
-  // packet must carry useful memory, not a log (PART D #36).
-  const sources = [...input.recentSources]
-    .filter((s) => (s.analysis?.relevance ?? 0) >= 0.5)
-    .sort((a, b) => (b.analysis?.relevance ?? 0) - (a.analysis?.relevance ?? 0))
-    .slice(0, 6);
-
-  lines.push("# GhostTab Workspace Context", "");
-  lines.push("WORKSPACE");
-  lines.push(input.workspace.name, "");
-
-  if (input.workspace.goal) {
-    lines.push("GOAL");
-    lines.push(input.workspace.goal, "");
+  if (opts?.apiKey) {
+    try {
+      const client = new KiloClient(opts);
+      const messages = buildContinuationMessages(state);
+      const aiText = await client.chat(messages, { temperature: 0.1 });
+      if (aiText && aiText.trim().length > 40) {
+        return finalize(aiText.trim(), state, true);
+      }
+    } catch (err) {
+      console.warn("[GhostTab] continuation AI compress failed, using deterministic:", err);
+    }
   }
 
-  // Current focus derived from recent meaningful memory, not implementation logs.
-  const currentFocus =
-    goals[0]?.title || questions[0]?.title || input.workspace.goal || "—";
-  lines.push("CURRENT FOCUS");
-  lines.push(currentFocus, "");
+  return finalize(deterministic, state, false);
+}
 
-  const block = (label: string, items: ContextItem[]) => {
+function assembleDeterministic(state: ContinuationInputState): string {
+  const lines: string[] = [];
+  const { workspace, approvedMemories, relevantSources } = state;
+
+  const decisions = approvedMemories.filter((m) => m.type === "decision");
+  const goals = approvedMemories.filter((m) => m.type === "goal");
+  const questions = approvedMemories.filter((m) => m.type === "question");
+  const facts = approvedMemories.filter((m) => m.type === "fact");
+
+  lines.push("# Workspace Context", "");
+  lines.push("WORKSPACE");
+  lines.push(workspace.name, "");
+
+  if (workspace.goal) {
+    lines.push("GOAL");
+    lines.push(workspace.goal, "");
+  }
+
+  lines.push("CURRENT FOCUS");
+  lines.push(workspace.currentFocus || workspace.goal || "—", "");
+
+  const block = (label: string, items: ApprovedMemory[]) => {
     if (!items.length) return;
     lines.push(label);
     for (const it of items.slice(0, 12)) lines.push(`- ${it.title}`);
@@ -80,36 +135,40 @@ export function generateContinuationContext(input: ContinuationInput): Continuat
   };
 
   block("CONFIRMED DECISIONS", decisions);
+  block("GOALS", goals);
   block("OPEN QUESTIONS", questions);
   block("IMPORTANT FACTS", facts);
 
-  if (sources.length) {
+  if (relevantSources.length) {
     lines.push("RELEVANT SOURCES");
-    for (const s of sources) {
-      const oneLine = (s.analysis?.summary || s.title || "")
-        .split("\n")[0]
-        .slice(0, 140);
-      const plat = s.source?.platform ? `[${s.source.platform}] ` : "";
-      lines.push(`- ${plat}${s.title} — ${oneLine}`);
+    for (const s of relevantSources) {
+      const oneLine = s.summary.split("\n")[0].slice(0, 160);
+      const plat = s.url ? ` (${s.url})` : "";
+      lines.push(`- ${s.title}${plat} — ${oneLine}`);
     }
     lines.push("");
   }
 
-  lines.push("CONTINUE");
-  lines.push(
-    "Continue the work from this context. Do not restart from scratch."
-  );
-
-  const text = lines.join("\n");
-  return {
-    text,
-    decisionCount: decisions.length,
-    goalCount: goals.length,
-    questionCount: questions.length,
-    factCount: facts.length,
-    sourceCount: sources.length,
-    estimatedTokens: estimateTokens(text),
-  };
+  return lines.join("\n");
 }
 
-export { CONTINUATION_SYSTEM_PROMPT };
+function finalize(
+  text: string,
+  state: ContinuationInputState,
+  usedAI: boolean
+): ContinuationPacket {
+  const decisions = state.approvedMemories.filter((m) => m.type === "decision").length;
+  const goals = state.approvedMemories.filter((m) => m.type === "goal").length;
+  const questions = state.approvedMemories.filter((m) => m.type === "question").length;
+  const facts = state.approvedMemories.filter((m) => m.type === "fact").length;
+  return {
+    text,
+    decisionCount: decisions,
+    goalCount: goals,
+    questionCount: questions,
+    factCount: facts,
+    sourceCount: state.relevantSources.length,
+    estimatedTokens: estimateTokens(text),
+    usedAI,
+  };
+}

@@ -1,38 +1,47 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X, Copy, Check as CheckIcon } from "lucide-react";
 import type { ContextItem } from "@/types";
+import type { ContinuationPacket } from "@/lib/ai/continue";
+import { generateContinuationContext, buildContinuationState } from "@/lib/ai/continue";
 import { IconButton } from "@/components/ui/IconButton";
 import { Button } from "@/components/ui/Button";
-import { generateContinuationContext } from "@/lib/ai/continue";
 
 export function ContinueModal({
   workspaceName,
   memories,
   sources,
-  activity,
   onClose,
   onContinue,
 }: {
   workspaceName: string;
   memories: ContextItem[];
   sources: ContextItem[];
-  activity: { title: string; at: number }[];
   onClose: () => void;
   onContinue: (platform: "chatgpt" | "claude") => void;
 }) {
   const [showContext, setShowContext] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [packet, setPacket] = useState<ContinuationPacket | null>(null);
 
-  const packet = generateContinuationContext({
-    workspace: { name: workspaceName },
-    memories,
-    recentSources: sources,
-    recentActivity: activity,
-  });
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const state = buildContinuationState(
+        { name: workspaceName },
+        memories,
+        sources
+      );
+      const p = await generateContinuationContext(state);
+      if (mounted) setPacket(p);
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [workspaceName, memories, sources]);
 
   const copyContext = async () => {
     try {
-      if (navigator.clipboard) {
+      if (navigator.clipboard && packet) {
         await navigator.clipboard.writeText(packet.text);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
@@ -42,7 +51,9 @@ export function ContinueModal({
     }
   };
 
-  const enough = packet.decisionCount + packet.goalCount + packet.questionCount + packet.sourceCount > 0;
+  const enough =
+    !!packet &&
+    packet.decisionCount + packet.goalCount + packet.questionCount + packet.sourceCount > 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 backdrop-blur-sm sm:items-center">
@@ -58,7 +69,7 @@ export function ContinueModal({
         </header>
 
         <main className="flex-1 overflow-y-auto px-4 py-4">
-          {enough ? (
+          {packet && enough ? (
             <div className="rounded-xl border border-success/20 bg-success/5 p-3 text-[12.5px] text-success">
               <div className="font-medium">GhostTab will bring:</div>
               <ul className="mt-1.5 grid grid-cols-2 gap-y-1">
@@ -79,7 +90,7 @@ export function ContinueModal({
             </div>
           )}
 
-          {showContext && (
+          {showContext && packet && (
             <div className="mt-3">
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">

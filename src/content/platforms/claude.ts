@@ -90,6 +90,7 @@ export async function extractClaude(): Promise<ConversationContext> {
   const seen = new Map<string, ConversationMessage>();
   let order = 0;
   let noNewStreak = 0;
+  let reachedTop = false;
 
   scrollEl.scrollTop = 0;
   await delay(SAFEGUARDS.scrollDelayMs * 2);
@@ -116,13 +117,20 @@ export async function extractClaude(): Promise<ConversationContext> {
     for (const m of seen.values()) total += m.text.length;
     if (total >= SAFEGUARDS.maxChars) break;
 
-    scrollEl.scrollTop += Math.max(400, scrollEl.clientHeight * 0.8);
+    const prevTop = scrollEl.scrollTop;
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollTop - Math.max(400, scrollEl.clientHeight * 0.8));
     await delay(SAFEGUARDS.scrollDelayMs);
+    if (scrollEl.scrollTop <= prevTop) {
+      reachedTop = true;
+      break;
+    }
   }
 
   scrollEl.scrollTop = savedTop;
 
   const messages = [...seen.values()].sort((a, b) => a.index - b.index);
+
+  const isConversation = messages.length >= 2;
 
   let title = (document.title || "").trim();
   if (!title || /claude/i.test(title)) {
@@ -136,11 +144,14 @@ export async function extractClaude(): Promise<ConversationContext> {
 
   return {
     platform: "claude",
-    title,
+    isConversation,
+    title: title || "Claude",
     url,
     messages,
     fullText,
     messageCount: messages.length,
+    wordCount: fullText ? fullText.split(/\s+/).length : 0,
+    captureStatus: isConversation ? (reachedTop ? "complete" : "partial") : "complete",
   };
 }
 

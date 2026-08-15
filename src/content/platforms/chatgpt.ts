@@ -77,6 +77,7 @@ export async function extractChatGPT(): Promise<ConversationContext> {
   const seen = new Map<string, ConversationMessage>();
   let order = 0;
   let noNewStreak = 0;
+  let reachedTop = false;
 
   // Start at the top so the oldest messages load first (chronological order).
   scrollEl.scrollTop = 0;
@@ -104,14 +105,23 @@ export async function extractChatGPT(): Promise<ConversationContext> {
     for (const m of seen.values()) total += m.text.length;
     if (total >= SAFEGUARDS.maxChars) break;
 
-    scrollEl.scrollTop += Math.max(400, scrollEl.clientHeight * 0.8);
+    const prevTop = scrollEl.scrollTop;
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollTop - Math.max(400, scrollEl.clientHeight * 0.8));
     await delay(SAFEGUARDS.scrollDelayMs);
+    if (scrollEl.scrollTop <= prevTop) {
+      reachedTop = true;
+      break;
+    }
   }
 
   // Restore the user's position (PART A #40).
   scrollEl.scrollTop = savedTop;
 
   const messages = [...seen.values()].sort((a, b) => a.index - b.index);
+
+  // A real conversation needs multiple distinct turns (Part 5). Homepages and
+  // empty threads are NOT conversations — fall back to a webpage source.
+  const isConversation = messages.length >= 2;
 
   let title = (document.title || "").trim();
   if (!title || /chatgpt/i.test(title)) {
@@ -125,11 +135,14 @@ export async function extractChatGPT(): Promise<ConversationContext> {
 
   return {
     platform: "chatgpt",
-    title,
+    isConversation,
+    title: title || "ChatGPT",
     url,
     messages,
     fullText,
     messageCount: messages.length,
+    wordCount: fullText ? fullText.split(/\s+/).length : 0,
+    captureStatus: isConversation ? (reachedTop ? "complete" : "partial") : "complete",
   };
 }
 

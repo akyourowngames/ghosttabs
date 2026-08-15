@@ -74,7 +74,14 @@ export function localCurate(input: AnalyzeContextInput): ContextAnalysis {
     summary: `Local extraction from ${
       source.title || source.url || "captured source"
     } — ${deduped.length} memory candidate(s).`,
+    keyTopics: [],
+    importantPoints: [],
+    goals: deduped.filter((m) => m.type === "goal").map((m) => m.title),
+    decisions: deduped.filter((m) => m.type === "decision").map((m) => m.title),
+    questions: deduped.filter((m) => m.type === "question").map((m) => m.title),
+    facts: deduped.filter((m) => m.type === "fact").map((m) => m.title),
     relevance,
+    sourceQuality: "medium",
     memories: deduped,
   };
 }

@@ -5,11 +5,14 @@ import type {
   PageContext,
   Workspace,
   WorkspaceState,
+  ApprovedMemory,
 } from "@/types";
 import * as storage from "@/lib/storage";
 import {
   buildConversationItem,
+  buildConversationDocument,
   buildPageItem,
+  buildPageDocument,
   analysisTextForConversation,
 } from "@/lib/context";
 import {
@@ -23,7 +26,10 @@ import {
   type AnalyzeContextInput,
   type ContextAnalysis,
 } from "@/lib/ai";
-import { generateContinuationContext } from "@/lib/ai/continue";
+import {
+  generateContinuationContext,
+  buildContinuationState,
+} from "@/lib/ai/continue";
 import { Toast } from "@/components/Toast";
 import { ContinueModal } from "@/components/ContinueModal";
 import { SettingsView, DEFAULT_SETTINGS, type SettingsState } from "./views/SettingsView";
@@ -31,6 +37,7 @@ import { WorkspaceListView } from "./views/WorkspaceListView";
 import { WorkspaceDetailView } from "./views/WorkspaceDetailView";
 import { SourceDetailView } from "./views/SourceDetailView";
 import { testConnection } from "@/lib/ai/client";
+import { ChatView } from "@/components/ChatView";
 
 type View =
   | { kind: "list" }
@@ -66,6 +73,10 @@ export function App() {
   const [context, setContext] = useState<Record<string, ContextItem[]>>({});
   const [states, setStates] = useState<Record<string, WorkspaceState>>({});
   const [view, setView] = useState<View>({ kind: "list" });
+  const [tab, setTab] = useState<"workspace" | "chat">("workspace");
+  const [selectedWorkspaceId, setSelectedWorkspaceIdState] = useState<
+    string | undefined
+  >(undefined);
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastSeq = useRef(0);
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
@@ -100,6 +111,7 @@ export function App() {
       setStates(stateMap);
       setReady(true);
       if (selected && ws.some((w) => w.id === selected)) {
+        setSelectedWorkspaceIdState(selected);
         setView({ kind: "detail", id: selected });
       }
     })().catch((err) => {
@@ -129,6 +141,7 @@ export function App() {
     setWorkspaces((w) => [ws, ...w]);
     setContext((c) => ({ ...c, [ws.id]: [] }));
     await storage.setSelectedWorkspaceId(ws.id);
+    setSelectedWorkspaceIdState(ws.id);
     setView({ kind: "detail", id: ws.id });
     notify("Workspace created");
   };
@@ -164,6 +177,7 @@ export function App() {
       let analysis: ContextAnalysis | null = null;
       let raw = "";
       let usedLocal = false;
+      let approved: ApprovedMemory[] = [];
       if (key) {
         try {
           const res = await analyzeContext(input, {
@@ -172,6 +186,7 @@ export function App() {
           });
           analysis = res.analysis;
           raw = res.raw;
+          approved = res.approved;
         } catch (e) {
           raw = `AI call failed: ${e instanceof Error ? e.message : String(e)}`;
         }
@@ -192,6 +207,7 @@ export function App() {
             "\n\n[local extraction fallback — AI returned no memory]\n" +
             JSON.stringify(local, null, 2);
         }
+        approved = local.memories;
         usedLocal = true;
       }
 
@@ -209,7 +225,7 @@ export function App() {
       await storage.addContextItem({ ...builtItem, analysis, analysisRaw: raw });
 
       const newOnes = convertMemoriesToItems(
-        analysis,
+        approved,
         wsId,
         builtItem.source?.url,
         existing
@@ -295,7 +311,8 @@ export function App() {
         return;
       }
       notify(`Captured ${conv.messageCount} messages…`);
-      const convItem = buildConversationItem(wsId, conv);
+      const convDoc = buildConversationDocument(wsId, conv);
+      const convItem = buildConversationItem(wsId, conv, convDoc);
       await storage.addContextItem(convItem);
       await refreshContext(wsId);
       lastCapture.current = { wsId };
@@ -351,7 +368,8 @@ export function App() {
       return;
     }
 
-    const pageItem = buildPageItem(wsId, ctx);
+    const pageDoc = buildPageDocument(wsId, ctx);
+    const pageItem = buildPageItem(wsId, ctx, pageDoc);
     await storage.addContextItem(pageItem);
     await refreshContext(wsId);
     lastCapture.current = { wsId };
@@ -394,6 +412,7 @@ export function App() {
 
   const openWorkspace = async (id: string) => {
     await storage.setSelectedWorkspaceId(id);
+    setSelectedWorkspaceIdState(id);
     setView({ kind: "detail", id });
   };
 
@@ -405,14 +424,18 @@ export function App() {
 
   const doContinue = async (platform: "chatgpt" | "claude") => {
     const name = platform === "chatgpt" ? "ChatGPT" : "Claude";
-    const packet = generateContinuationContext({
-      workspace: {
+    const state = buildContinuationState(
+      {
         name: activeWorkspace?.name ?? "Workspace",
         goal: activeWorkspace?.goal,
+        currentFocus: activeWorkspace?.currentFocus,
       },
-      memories: memoryItems,
-      recentSources: sources,
-      recentActivity: activity,
+      memoryItems,
+      sources
+    );
+    const packet = await generateContinuationContext(state, {
+      apiKey: settings.apiKey,
+      model: settings.model,
     });
 
     let copied = false;
@@ -473,8 +496,29 @@ export function App() {
       ? items.find((i) => i.id === view.id)
       : undefined;
 
+  // The chat tab is scoped to the currently selected workspace.
+  const chatWorkspaceId = selectedWorkspaceId ?? workspaces[0]?.id;
+  const chatWorkspace = workspaces.find((w) => w.id === chatWorkspaceId);
+  const chatItems = chatWorkspaceId ? context[chatWorkspaceId] ?? [] : [];
+
   return (
     <div className="relative flex h-screen w-full flex-col bg-background text-foreground">
+      {/* Top-level tab switcher: Workspace | Chat */}
+      <div className="flex shrink-0 border-b border-border/80 bg-background">
+        <button
+          onClick={() => setTab("workspace")}
+          className={`flex-1 px-3 py-2 text-[12.5px] font-medium transition-colors ${tab === "workspace" ? "border-b-2 border-primary text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          Workspace
+        </button>
+        <button
+          onClick={() => setTab("chat")}
+          className={`flex-1 px-3 py-2 text-[12.5px] font-medium transition-colors ${tab === "chat" ? "border-b-2 border-primary text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          Chat
+        </button>
+      </div>
+
       {toast && (
         <Toast
           key={toast.id}
@@ -486,7 +530,7 @@ export function App() {
         />
       )}
 
-      {view.kind === "list" && (
+      {tab === "workspace" && view.kind === "list" && (
         <WorkspaceListView
           workspaces={workspaces}
           context={context}
@@ -497,7 +541,7 @@ export function App() {
         />
       )}
 
-      {view.kind === "detail" && activeWorkspace && (
+      {tab === "workspace" && view.kind === "detail" && activeWorkspace && (
         <WorkspaceDetailView
           workspace={activeWorkspace}
           memoryItems={memoryItems}
@@ -512,14 +556,14 @@ export function App() {
         />
       )}
 
-      {view.kind === "source" && sourceItem && (
+      {tab === "workspace" && view.kind === "source" && sourceItem && (
         <SourceDetailView
           item={sourceItem}
           onBack={() => setView({ kind: "detail", id: sourceItem.workspaceId })}
         />
       )}
 
-      {view.kind === "settings" && (
+      {tab === "workspace" && view.kind === "settings" && (
         <SettingsView
           onBack={() => setView({ kind: "list" })}
           settings={settings}
@@ -562,12 +606,27 @@ export function App() {
         />
       )}
 
-      {showContinue && activeWorkspace && (
+      {tab === "chat" && chatWorkspace ? (
+        <ChatView
+          workspace={chatWorkspace}
+          items={chatItems}
+          settings={settings}
+          onMemoryChanged={() => {
+            if (chatWorkspaceId) void refreshContext(chatWorkspaceId);
+          }}
+          onBack={() => setTab("workspace")}
+        />
+      ) : tab === "chat" ? (
+        <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-muted-foreground">
+          No workspace selected. Create or open a workspace first.
+        </div>
+      ) : null}
+
+      {tab === "workspace" && showContinue && activeWorkspace && (
         <ContinueModal
           workspaceName={activeWorkspace.name}
           memories={memoryItems}
           sources={sources}
-          activity={activity}
           onClose={() => setShowContinue(false)}
           onContinue={(platform) => void doContinue(platform)}
         />
