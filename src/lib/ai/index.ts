@@ -6,15 +6,17 @@ import type {
   MemoryType,
 } from "@/types";
 import { uid } from "@/lib/utils/format";
-import { KiloClient, type KiloClientOptions } from "./client";
+import { KiloClient, FALLBACK_MODEL, type KiloClientOptions } from "./client";
 import { buildAnalysisMessages } from "./prompts";
 import { normalizeForDedupe, parseContextAnalysis } from "./extract";
+import { localCurate } from "./local";
 
+export { localCurate } from "./local";
 export type { AnalyzeContextInput, ContextAnalysis, MemoryCandidate } from "@/types";
 export { parseContextAnalysis, extractJson, validateMemoryCandidates } from "./extract";
 
 /** Confidence threshold: below this, an item is an AI observation, not durable memory. */
-export const MEMORY_CONFIDENCE_THRESHOLD = 0.75;
+export const MEMORY_CONFIDENCE_THRESHOLD = 0.6;
 
 export interface AnalyzeOptions extends KiloClientOptions {}
 
@@ -29,8 +31,27 @@ export async function analyzeContext(
 ): Promise<{ analysis: ContextAnalysis | null; raw: string }> {
   const client = new KiloClient(opts);
   const messages = buildAnalysisMessages(input);
-  const raw = await client.chat(messages, { json: true, temperature: 0.2 });
-  return { analysis: parseContextAnalysis(raw), raw };
+  try {
+    const raw = await client.chat(messages, { json: true, temperature: 0.2 });
+    return { analysis: parseContextAnalysis(raw), raw };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Auto-recover: if the chosen model needs a signed-in (paid) account,
+    // retry transparently with the free fallback model so capture still works.
+    if (
+      opts.model &&
+      opts.model !== FALLBACK_MODEL &&
+      /PAID_MODEL_AUTH_REQUIRED|sign in to use this model/i.test(msg)
+    ) {
+      const fb = new KiloClient({ ...opts, model: FALLBACK_MODEL });
+      const raw = await fb.chat(messages, { json: true, temperature: 0.2 });
+      return {
+        analysis: parseContextAnalysis(raw),
+        raw: `[auto-fallback to ${FALLBACK_MODEL}]\n` + raw,
+      };
+    }
+    throw e;
+  }
 }
 
 /**
@@ -87,24 +108,17 @@ export function dedupeAgainstExisting(
 }
 
 /**
- * Dev fallback used only when no Kilo API key is configured. Clearly marked,
- * and intentionally produces NO durable memory (we never invent user data).
+ * Local curator fallback used when no Kilo key is configured or the AI call
+ * fails. Guarantees the workspace gains at least some memory instead of
+ * nothing, and is clearly labeled as local (never a model response).
  */
 export function devFallbackAnalysis(input: AnalyzeContextInput): {
   analysis: ContextAnalysis;
   raw: string;
 } {
-  console.warn("[GhostTab] dev fallback: no Kilo API key — skipping memory extraction.");
-  const firstSentence = (input.source.content || "")
-    .split(/(?<=[.!?])\s+/)[0]
-    ?.slice(0, 240);
-  const analysis: ContextAnalysis = {
-    summary: firstSentence || input.source.title,
-    relevance: input.workspace.goal ? 0.55 : 0.45,
-    memories: [],
-  };
+  const analysis = localCurate(input);
   return {
     analysis,
-    raw: "[dev fallback] No Kilo API key configured — memory extraction skipped.",
+    raw: "[local extraction — no API call]\n" + JSON.stringify(analysis, null, 2),
   };
 }

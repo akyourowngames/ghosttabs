@@ -19,17 +19,18 @@ import {
 import {
   analyzeContext,
   convertMemoriesToItems,
-  devFallbackAnalysis,
+  localCurate,
   type AnalyzeContextInput,
+  type ContextAnalysis,
 } from "@/lib/ai";
 import { generateContinuationContext } from "@/lib/ai/continue";
 import { Toast } from "@/components/Toast";
 import { ContinueModal } from "@/components/ContinueModal";
-import { DEFAULT_SETTINGS, type SettingsState } from "./views/SettingsView";
+import { SettingsView, DEFAULT_SETTINGS, type SettingsState } from "./views/SettingsView";
 import { WorkspaceListView } from "./views/WorkspaceListView";
 import { WorkspaceDetailView } from "./views/WorkspaceDetailView";
 import { SourceDetailView } from "./views/SourceDetailView";
-import { SettingsView } from "./views/SettingsView";
+import { testConnection } from "@/lib/ai/client";
 
 type View =
   | { kind: "list" }
@@ -46,6 +47,17 @@ type ToastData = {
 
 const SETTINGS_KEY = "settings";
 
+/** Normalize a URL to a stable capture identity (drop query/hash/trailing slash). */
+function normalizeUrl(u?: string): string {
+  if (!u) return "";
+  try {
+    const url = new URL(u);
+    return (url.host + url.pathname).replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return u.trim().toLowerCase();
+  }
+}
+
 const SOURCE_TYPES = new Set(["page", "conversation", "snippet"]);
 const MEMORY_TYPES = new Set(["decision", "goal", "question", "fact"]);
 
@@ -57,6 +69,8 @@ export function App() {
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastSeq = useRef(0);
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
+  const [testState, setTestState] = useState<"idle" | "testing">("idle");
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ready, setReady] = useState(false);
   const [showContinue, setShowContinue] = useState(false);
   const lastCapture = useRef<{ wsId: string } | null>(null);
@@ -146,18 +160,47 @@ export function App() {
     );
 
     try {
-      const { analysis, raw } = key
-        ? await analyzeContext(input, { apiKey: key, model: settings.model })
-        : devFallbackAnalysis(input);
+      // 1) Try the AI service when a key is configured.
+      let analysis: ContextAnalysis | null = null;
+      let raw = "";
+      let usedLocal = false;
+      if (key) {
+        try {
+          const res = await analyzeContext(input, {
+            apiKey: key,
+            model: settings.model,
+          });
+          analysis = res.analysis;
+          raw = res.raw;
+        } catch (e) {
+          raw = `AI call failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+
+      // 2) Fall back to LOCAL curation when there is no key, the call failed,
+      //    or the model returned nothing. This guarantees the workspace always
+      //    gains some memory instead of leaving you with only a relevance tag.
+      if (!analysis || analysis.memories.length === 0) {
+        const local = localCurate(input);
+        if (!analysis) {
+          analysis = local;
+          raw = "[local extraction — no API call]\n" + JSON.stringify(local, null, 2);
+        } else {
+          analysis = local;
+          raw =
+            raw +
+            "\n\n[local extraction fallback — AI returned no memory]\n" +
+            JSON.stringify(local, null, 2);
+        }
+        usedLocal = true;
+      }
 
       if (!analysis) {
-        // Store the raw model response even when nothing parseable came back,
-        // so the user can inspect exactly what the model returned.
         await storage.addContextItem({ ...builtItem, analysisRaw: raw });
         notify(
           kind === "conversation"
-            ? "Conversation captured — AI returned no usable memory."
-            : "Page captured — AI returned no usable memory.",
+            ? "Conversation captured — no memory extracted."
+            : "Page captured — no memory extracted.",
           { title: "Captured", action: { label: "View context", onClick: () => setView({ kind: "detail", id: wsId }) } }
         );
         return;
@@ -180,7 +223,7 @@ export function App() {
           ? `${builtItem.messageCount ?? 0} messages captured`
           : "Page captured";
       notify(analysis.summary || "Workspace updated with structured context.", {
-        title: key ? label : "Captured (dev fallback)",
+        title: usedLocal ? "Captured (local)" : label,
         action: {
           label: "View context",
           onClick: () => setView({ kind: "detail", id: wsId }),
@@ -239,6 +282,18 @@ export function App() {
       (conv.platform === "chatgpt" || conv.platform === "claude") &&
       conv.messageCount > 0
     ) {
+      // Dedupe: don't capture the same conversation URL twice.
+      const norm = normalizeUrl(conv.url);
+      const prior = (await storage.getContextItems(wsId)).find(
+        (i) => i.source?.url && normalizeUrl(i.source.url) === norm
+      );
+      if (prior) {
+        notify("This conversation was already captured.", {
+          title: "Already captured",
+          action: { label: "View", onClick: () => setView({ kind: "source", id: prior.id }) },
+        });
+        return;
+      }
       notify(`Captured ${conv.messageCount} messages…`);
       const convItem = buildConversationItem(wsId, conv);
       await storage.addContextItem(convItem);
@@ -279,6 +334,19 @@ export function App() {
     if (!ctx) {
       notify("Open a normal website, then try again", {
         title: "Can't read this page",
+      });
+      return;
+    }
+
+    // Dedupe: don't capture the same page URL twice in one workspace.
+    const norm = normalizeUrl(ctx.url);
+    const prior = (await storage.getContextItems(wsId)).find(
+      (i) => i.source?.url && normalizeUrl(i.source.url) === norm
+    );
+    if (prior) {
+      notify("This page was already captured.", {
+        title: "Already captured",
+        action: { label: "View", onClick: () => setView({ kind: "source", id: prior.id }) },
       });
       return;
     }
@@ -461,6 +529,18 @@ export function App() {
               void storage.setMeta(SETTINGS_KEY, merged);
               return merged;
             });
+          }}
+          testState={testState}
+          testResult={testResult}
+          onTestConnection={async () => {
+            setTestState("testing");
+            setTestResult(null);
+            const res = await testConnection(
+              settings.apiKey.trim(),
+              settings.model.trim() || "tencent/hy3:free"
+            );
+            setTestResult(res);
+            setTestState("idle");
           }}
           onResetDemo={async () => {
             if (

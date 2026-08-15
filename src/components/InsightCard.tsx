@@ -1,5 +1,6 @@
 import type { ContextAnalysis, MemoryCandidate } from "@/types";
 import { relevanceLabel } from "@/lib/utils/relevance";
+import { MEMORY_CONFIDENCE_THRESHOLD } from "@/lib/ai";
 import { Sparkles } from "lucide-react";
 
 const TYPE_LABEL: Record<MemoryCandidate["type"], string> = {
@@ -60,7 +61,7 @@ export function InsightCard({ analysis }: { analysis: ContextAnalysis }) {
                     <span className="mt-px text-primary/70">{TYPE_ICON[g.type]}</span>
                     <span>
                       {m.title}
-                      {m.confidence < 0.75 && (
+                      {m.confidence < MEMORY_CONFIDENCE_THRESHOLD && (
                         <span className="ml-1 text-[10px] font-normal text-muted-foreground">
                           · observation
                         </span>

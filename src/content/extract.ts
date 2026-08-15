@@ -239,45 +239,76 @@ export async function extractConversationContext(): Promise<{
     const savedTop = scrollEl.scrollTop;
     const seen = new Map<
       string,
-      { role: "user" | "assistant" | "unknown"; text: string; index: number }
+      { role: "user" | "assistant" | "unknown"; text: string; chunkRank: number; domPos: number }
     >();
-    let order = 0;
-    let noNewStreak = 0;
+    let chunkRank = 0;
 
-    scrollEl.scrollTop = 0;
-    await delay(SAFEGUARDS.scrollDelayMs * 2);
-
-    for (let attempt = 0; attempt < SAFEGUARDS.maxScrollAttempts; attempt++) {
-      const turns = collect();
-      let added = 0;
-      for (const t of turns) {
+    const collectAll = () => {
+      const turns = collect(); // DOM order: oldest -> newest within viewport
+      turns.forEach((t, domPos) => {
         const key = normalizeKey(t.role, t.text);
-        if (!key || seen.has(key)) continue;
-        seen.set(key, { role: t.role, text: t.text, index: order++ });
-        added++;
-      }
-      if (added === 0) {
-        noNewStreak += 1;
-        if (noNewStreak >= SAFEGUARDS.noNewThreshold) break;
-      } else {
-        noNewStreak = 0;
-      }
+        if (!key || seen.has(key)) return;
+        seen.set(key, { role: t.role, text: t.text, chunkRank, domPos });
+      });
+      chunkRank++;
+    };
+
+    // Start at the current position (usually the bottom / latest messages),
+    // then scroll UP so the chat client lazily loads older turns (ChatGPT and
+    // Claude load history when you scroll toward the top).
+    collectAll();
+    await delay(SAFEGUARDS.scrollDelayMs);
+
+    let stuckStreak = 0;
+    for (let attempt = 0; attempt < SAFEGUARDS.maxScrollAttempts; attempt++) {
+      const before = scrollEl.scrollTop;
+      scrollEl.scrollTop = Math.max(
+        0,
+        scrollEl.scrollTop - Math.max(400, scrollEl.clientHeight * 0.8)
+      );
+      await delay(SAFEGUARDS.scrollDelayMs);
+      collectAll();
+
       if (seen.size >= SAFEGUARDS.maxMessages) break;
       let total = 0;
       for (const m of seen.values()) total += m.text.length;
       if (total >= SAFEGUARDS.maxChars) break;
-      scrollEl.scrollTop += Math.max(400, scrollEl.clientHeight * 0.8);
-      await delay(SAFEGUARDS.scrollDelayMs);
+
+      const after = scrollEl.scrollTop;
+      if (Math.abs(after - before) < 2) {
+        // Reached the top (or can't scroll further) — give it one more pass
+        // for any final load, then stop.
+        stuckStreak += 1;
+        if (stuckStreak >= 2) break;
+      } else {
+        stuckStreak = 0;
+      }
     }
     scrollEl.scrollTop = savedTop;
-    return [...seen.values()].sort((a, b) => a.index - b.index);
+
+    // Oldest -> newest: older chunks were collected later (higher chunkRank)
+    // and should come first; within a chunk, preserve DOM order (domPos).
+    return [...seen.values()]
+      .sort((a, b) => b.chunkRank - a.chunkRank || a.domPos - b.domPos)
+      .map((m, index) => ({ role: m.role, text: m.text, index }));
   };
 
   const url = location.href;
   const platform = detectPlatform(url);
 
+  // If per-turn role detection failed entirely, infer by alternation
+  // (conversations start with the user).
+  const inferRolesIfNeeded = (
+    msgs: { role: "user" | "assistant" | "unknown"; text: string; index: number }[]
+  ) => {
+    if (msgs.length && msgs.every((m) => m.role === "unknown")) {
+      msgs.forEach((m, i) => (m.role = i % 2 === 0 ? "user" : "assistant"));
+    }
+    return msgs;
+  };
+
   if (platform === "chatgpt") {
-    const messages = await walk(collectChatGPTTurns);
+    const messages = inferRolesIfNeeded(await walk(collectChatGPTTurns));
     let title = (document.title || "").trim();
     if (!title || /chatgpt/i.test(title)) {
       const firstUser = messages.find((m) => m.role === "user");
@@ -288,7 +319,7 @@ export async function extractConversationContext(): Promise<{
   }
 
   if (platform === "claude") {
-    const messages = await walk(collectClaudeTurns);
+    const messages = inferRolesIfNeeded(await walk(collectClaudeTurns));
     let title = (document.title || "").trim();
     if (!title || /claude/i.test(title)) {
       const firstUser = messages.find((m) => m.role === "user");

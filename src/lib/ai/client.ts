@@ -10,7 +10,12 @@ export interface ChatMessage {
 }
 
 const DEFAULT_BASE_URL = "https://api.kilo.ai/api/gateway";
-const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
+// Default model works WITHOUT signing in (free tier) so the AI path succeeds
+// out of the box. Some models (e.g. anthropic/claude-sonnet-4.5) require a
+// signed-in Kilo account and return PAID_MODEL_AUTH_REQUIRED.
+const DEFAULT_MODEL = "tencent/hy3:free";
+// Used to auto-recover when the chosen model needs paid sign-in.
+export const FALLBACK_MODEL = "tencent/hy3:free";
 
 export interface KiloClientOptions {
   apiKey: string;
@@ -80,5 +85,33 @@ export class KiloClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+}
+
+/** Lightweight connectivity check used by the Settings "Test connection" button. */
+export async function testConnection(
+  apiKey: string,
+  model: string
+): Promise<{ ok: boolean; message: string }> {
+  if (!apiKey.trim()) {
+    return { ok: false, message: "Enter your Kilo API key first." };
+  }
+  try {
+    const client = new KiloClient({ apiKey, model });
+    const content = await client.chat(
+      [{ role: "user", content: "Reply with the single word: OK" }],
+      { temperature: 0 }
+    );
+    return { ok: true, message: `Connected (${model}). Model replied: ${content.slice(0, 60).trim()}` };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/PAID_MODEL_AUTH_REQUIRED|sign in to use this model/i.test(msg)) {
+      return {
+        ok: false,
+        message:
+          "This model needs a signed-in Kilo account. Switch the model to tencent/hy3:free (or another :free model) to use it without signing in.",
+      };
+    }
+    return { ok: false, message: msg.slice(0, 200) };
   }
 }

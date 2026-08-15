@@ -5,6 +5,7 @@ import { Brand } from "@/components/Brand";
 import { IconButton } from "@/components/ui/IconButton";
 import { Badge } from "@/components/ui/Badge";
 import { relevanceLabel } from "@/lib/utils/relevance";
+import { MEMORY_CONFIDENCE_THRESHOLD } from "@/lib/ai";
 import { formatRelativeTime } from "@/lib/utils/format";
 
 export function SourceDetailView({
@@ -94,9 +95,9 @@ export function SourceDetailView({
                           {m.type}
                         </span>
                         <span
-                          className={`rounded-full px-1.5 py-0.5 text-[9.5px] font-medium ${m.confidence >= 0.75 ? "bg-success/10 text-success" : "bg-muted text-muted-foreground" }`}
+                          className={`rounded-full px-1.5 py-0.5 text-[9.5px] font-medium ${m.confidence >= MEMORY_CONFIDENCE_THRESHOLD ? "bg-success/10 text-success" : "bg-muted text-muted-foreground" }`}
                         >
-                          {m.confidence >= 0.75 ? "memory" : "observation"}
+                          {m.confidence >= MEMORY_CONFIDENCE_THRESHOLD ? "memory" : "observation"}
                         </span>
                       </div>
                       <div className="mt-1 text-[13px] font-medium text-foreground/90">

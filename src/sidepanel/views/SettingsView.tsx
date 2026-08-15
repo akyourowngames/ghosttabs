@@ -16,7 +16,7 @@ export interface SettingsState {
   autoCapture: boolean;
   clipboardFallback: boolean;
   apiKey: string;
-  /** Kilo model id, e.g. anthropic/claude-sonnet-4.5 */
+  /** Kilo model id, e.g. tencent/hy3:free */
   model: string;
 }
 
@@ -24,7 +24,7 @@ export const DEFAULT_SETTINGS: SettingsState = {
   autoCapture: true,
   clipboardFallback: true,
   apiKey: "",
-  model: "anthropic/claude-sonnet-4.5",
+  model: "tencent/hy3:free",
 };
 
 /** A titled, self-contained settings card with divided rows. */
@@ -77,11 +77,17 @@ export function SettingsView({
   settings,
   onChange,
   onResetDemo,
+  testState,
+  testResult,
+  onTestConnection,
 }: {
   onBack: () => void;
   settings: SettingsState;
   onChange: (next: Partial<SettingsState>) => void;
   onResetDemo: () => void;
+  testState: "idle" | "testing";
+  testResult: { ok: boolean; message: string } | null;
+  onTestConnection?: () => void;
 }) {
   return (
     <div className="flex h-full flex-col">
@@ -126,12 +132,31 @@ export function SettingsView({
               type="text"
               value={settings.model}
               onChange={(e) => onChange({ model: e.target.value })}
-              placeholder="anthropic/claude-sonnet-4.5"
+              placeholder="tencent/hy3:free"
               className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-[13px] outline-none placeholder:text-muted-foreground/50 focus:border-primary"
             />
             <p className="mt-1.5 text-[11px] text-muted-foreground">
               OpenAI-compatible model id used through the Kilo gateway.
+              Defaults to <span className="text-foreground/80">tencent/hy3:free</span>,
+              which works without a signed-in account.
             </p>
+          </div>
+          <div className="px-4 py-3">
+            <button
+              type="button"
+              onClick={() => void onTestConnection?.()}
+              disabled={testState === "testing"}
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-[12px] font-medium text-foreground/90 hover:bg-accent/40 disabled:opacity-50"
+            >
+              {testState === "testing" ? "Testing…" : "Test connection"}
+            </button>
+            {testResult && (
+              <p
+                className={`mt-1.5 text-[11px] leading-snug ${testResult.ok ? "text-success" : "text-danger"}`}
+              >
+                {testResult.message}
+              </p>
+            )}
           </div>
         </SettingsSection>
 
